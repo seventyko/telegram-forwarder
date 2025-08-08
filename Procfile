@@ -1,1 +1,1 @@
-"web: python telegram_forwarder.py" 
+web: python telegram_forwarder.py
