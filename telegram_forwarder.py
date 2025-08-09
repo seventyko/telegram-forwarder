@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Telegram Auto-Forward Bot + API for Railway Deployment - FINAL VERSION
+Telegram Auto-Forward Bot + API for Railway Deployment - FIXED FORWARDING
 """
 
 import asyncio
@@ -11,6 +11,7 @@ import logging
 from datetime import datetime, timedelta
 from fastapi import FastAPI, HTTPException, Depends, Header
 import uvicorn
+from contextlib import asynccontextmanager
 
 # Configure logging for Railway
 logging.basicConfig(
@@ -31,11 +32,8 @@ SESSION_STRING = os.getenv('SESSION_STRING', '')
 SOURCE_CHANNEL = 'WEB3_AGGREGATOR'
 TARGET_CHANNEL = os.getenv('TARGET_CHANNEL', 'YourPrivateChannel')
 
-# API security for n8n (optional - if not set, no auth required)
+# API security for n8n (optional)
 N8N_API_KEY = os.getenv('N8N_API_KEY', '')
-
-# FastAPI app
-app = FastAPI(title="Telegram Forwarder + n8n API", version="1.0.0")
 
 # Global variables
 telegram_client = None
@@ -49,12 +47,11 @@ async def verify_api_key(x_api_key: str = Header(None)):
         raise HTTPException(status_code=401, detail="Invalid API key")
     return True
 
-@app.on_event("startup")
-async def startup_event():
-    """Initialize Telegram client when FastAPI starts"""
+async def init_telegram():
+    """Initialize Telegram client and forwarding"""
     global telegram_client, target_channel_id, source_entity, target_entity
     
-    logger.info("🚀 FastAPI startup - initializing Telegram client...")
+    logger.info("🚀 Initializing Telegram client...")
     
     try:
         # Create Telegram client
@@ -84,7 +81,6 @@ async def startup_event():
                 logger.info(f"{session_str}")
                 logger.info("=" * 80)
                 logger.info("⚠️  Add this as SESSION_STRING environment variable in Railway!")
-                logger.info("⚠️  Then redeploy your app!")
                 logger.info("=" * 80)
             
             # Get channel entities
@@ -96,36 +92,62 @@ async def startup_event():
                 logger.info(f"📡 Source: {source_entity.title}")
                 logger.info(f"📥 Target: {target_entity.title} (ID: {target_channel_id})")
                 
-                # Set up forwarding
-                await setup_message_forwarding()
+                # Set up message forwarding
+                @telegram_client.on(events.NewMessage(chats=[source_entity]))
+                async def forward_handler(event):
+                    try:
+                        await telegram_client.forward_messages(
+                            entity=target_entity,
+                            messages=event.message,
+                            from_peer=source_entity
+                        )
+                        logger.info(f"✅ Forwarded message {event.message.id} from {source_entity.title}")
+                        
+                    except Exception as e:
+                        logger.error(f"❌ Forward failed: {e}")
+                
+                logger.info(f"🚀 Auto-forwarding ACTIVE: {SOURCE_CHANNEL} → {TARGET_CHANNEL}")
+                logger.info("🔄 Listening for new messages...")
+                
+                return True
                 
             except Exception as e:
                 logger.error(f"❌ Channel setup error: {e}")
+                return False
                 
         else:
             logger.error("❌ Telegram not authorized")
+            return False
             
     except Exception as e:
         logger.error(f"❌ Telegram startup failed: {e}")
+        return False
 
-async def setup_message_forwarding():
-    """Set up automatic message forwarding"""
-    global telegram_client, source_entity, target_entity
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Manage Telegram client lifecycle"""
+    logger.info("🌟 Starting application...")
     
-    @telegram_client.on(events.NewMessage(chats=[source_entity]))
-    async def forward_handler(event):
-        try:
-            await telegram_client.forward_messages(
-                entity=target_entity,
-                messages=event.message,
-                from_peer=source_entity
-            )
-            logger.info(f"✅ Forwarded message {event.message.id}")
-            
-        except Exception as e:
-            logger.error(f"❌ Forward failed: {e}")
+    # Initialize Telegram
+    success = await init_telegram()
+    if success:
+        logger.info("✅ Telegram forwarding initialized successfully")
+    else:
+        logger.error("❌ Telegram forwarding failed to initialize")
     
-    logger.info(f"🚀 Auto-forwarding active: {SOURCE_CHANNEL} → {TARGET_CHANNEL}")
+    yield
+    
+    # Cleanup
+    if telegram_client:
+        logger.info("🔄 Disconnecting Telegram client...")
+        await telegram_client.disconnect()
+
+# FastAPI app with lifespan management
+app = FastAPI(
+    title="Telegram Forwarder + n8n API", 
+    version="1.0.0",
+    lifespan=lifespan
+)
 
 @app.get("/")
 async def root():
@@ -136,6 +158,7 @@ async def root():
         "telegram_connected": telegram_client is not None and telegram_client.is_connected() if telegram_client else False,
         "target_channel": target_channel_id,
         "api_key_required": bool(N8N_API_KEY),
+        "forwarding_active": source_entity is not None and target_entity is not None,
         "endpoints": {
             "health": "/health",
             "messages": "/api/messages/{hours}",
@@ -152,6 +175,7 @@ async def health_check():
         "timestamp": datetime.now().isoformat(),
         "telegram_connected": telegram_client is not None and telegram_client.is_connected() if telegram_client else False,
         "target_channel_configured": target_channel_id is not None,
+        "forwarding_configured": source_entity is not None and target_entity is not None,
         "api_auth": "enabled" if N8N_API_KEY else "disabled"
     }
 
@@ -181,7 +205,6 @@ async def get_recent_messages(
         ):
             if message.text and message.text.strip():
                 # Extract channel ID without the -100 prefix for the link
-                # -1002659193089 -> 2659193089
                 channel_id_for_link = str(abs(target_channel_id))[3:]  # Remove -100 prefix
                 message_link = f"https://t.me/c/{channel_id_for_link}/{message.id}"
                 
@@ -247,49 +270,14 @@ async def get_combined_messages(
             detail=f"Error creating combined messages: {str(e)}"
         )
 
-# Keep the app running
-async def keep_alive():
-    """Keep the event loop running for Telegram client"""
-    try:
-        while True:
-            await asyncio.sleep(60)  # Check every minute
-            if telegram_client and telegram_client.is_connected():
-                continue
-            else:
-                logger.warning("⚠️ Telegram client disconnected, attempting reconnect...")
-                if telegram_client:
-                    await telegram_client.connect()
-    except Exception as e:
-        logger.error(f"❌ Keep alive error: {e}")
-
-# Custom ASGI application that runs both FastAPI and Telegram
-class TelegramFastAPIApp:
-    def __init__(self):
-        self.app = app
-    
-    async def __call__(self, scope, receive, send):
-        # Let FastAPI handle HTTP requests
-        await self.app(scope, receive, send)
-
-# Start the combined application
+# Run the server
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8000))
     logger.info(f"🌐 Starting Telegram Forwarder + FastAPI on port {port}")
     
-    # Create background task for keeping Telegram alive
-    async def run_with_telegram():
-        # Start keep alive task
-        asyncio.create_task(keep_alive())
-        
-        # Run FastAPI
-        config = uvicorn.Config(
-            app=app,
-            host="0.0.0.0",
-            port=port,
-            log_level="info"
-        )
-        server = uvicorn.Server(config)
-        await server.serve()
-    
-    # Run everything
-    asyncio.run(run_with_telegram())
+    uvicorn.run(
+        app, 
+        host="0.0.0.0", 
+        port=port,
+        log_level="info"
+    )
