@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Telegram Auto-Forward Bot + API for Railway Deployment
+Telegram Auto-Forward Bot + API for Railway Deployment - FINAL VERSION
 """
 
 import asyncio
@@ -9,10 +9,8 @@ from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 import logging
 from datetime import datetime, timedelta
-from typing import List, Dict, Optional
-import threading
-import uvicorn
 from fastapi import FastAPI, HTTPException, Depends, Header
+import uvicorn
 
 # Configure logging for Railway
 logging.basicConfig(
@@ -33,21 +31,118 @@ SESSION_STRING = os.getenv('SESSION_STRING', '')
 SOURCE_CHANNEL = 'WEB3_AGGREGATOR'
 TARGET_CHANNEL = os.getenv('TARGET_CHANNEL', 'YourPrivateChannel')
 
-# API security for n8n
-N8N_API_KEY = os.getenv('N8N_API_KEY', 'default-change-this-key')
+# API security for n8n (optional - if not set, no auth required)
+N8N_API_KEY = os.getenv('N8N_API_KEY', '')
 
 # FastAPI app
 app = FastAPI(title="Telegram Forwarder + n8n API", version="1.0.0")
 
-# Global client reference
+# Global variables
 telegram_client = None
 target_channel_id = None
+source_entity = None
+target_entity = None
 
-async def verify_api_key(x_api_key: str = Header(...)):
-    """Verify API key for n8n requests"""
-    if x_api_key != N8N_API_KEY:
+async def verify_api_key(x_api_key: str = Header(None)):
+    """Verify API key for n8n requests (optional if no key set)"""
+    if N8N_API_KEY and x_api_key != N8N_API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
     return True
+
+@app.on_event("startup")
+async def startup_event():
+    """Initialize Telegram client when FastAPI starts"""
+    global telegram_client, target_channel_id, source_entity, target_entity
+    
+    logger.info("🚀 FastAPI startup - initializing Telegram client...")
+    
+    try:
+        # Create Telegram client
+        if SESSION_STRING:
+            logger.info("📱 Using existing session string")
+            telegram_client = TelegramClient(
+                StringSession(SESSION_STRING), API_ID, API_HASH
+            )
+        else:
+            logger.info("🔑 No session string - need to generate one")
+            telegram_client = TelegramClient(
+                StringSession(), API_ID, API_HASH
+            )
+        
+        # Start client
+        await telegram_client.start(phone=PHONE_NUMBER)
+        
+        if await telegram_client.is_user_authorized():
+            me = await telegram_client.get_me()
+            logger.info(f"✅ Telegram connected as {me.first_name}")
+            
+            # Print session string for first-time setup
+            if not SESSION_STRING:
+                session_str = telegram_client.session.save()
+                logger.info("=" * 80)
+                logger.info("🔑 COPY THIS SESSION STRING FOR RAILWAY:")
+                logger.info(f"{session_str}")
+                logger.info("=" * 80)
+                logger.info("⚠️  Add this as SESSION_STRING environment variable in Railway!")
+                logger.info("⚠️  Then redeploy your app!")
+                logger.info("=" * 80)
+            
+            # Get channel entities
+            try:
+                source_entity = await telegram_client.get_entity(SOURCE_CHANNEL)
+                target_entity = await telegram_client.get_entity(TARGET_CHANNEL)
+                target_channel_id = target_entity.id
+                
+                logger.info(f"📡 Source: {source_entity.title}")
+                logger.info(f"📥 Target: {target_entity.title} (ID: {target_channel_id})")
+                
+                # Set up forwarding
+                await setup_message_forwarding()
+                
+            except Exception as e:
+                logger.error(f"❌ Channel setup error: {e}")
+                
+        else:
+            logger.error("❌ Telegram not authorized")
+            
+    except Exception as e:
+        logger.error(f"❌ Telegram startup failed: {e}")
+
+async def setup_message_forwarding():
+    """Set up automatic message forwarding"""
+    global telegram_client, source_entity, target_entity
+    
+    @telegram_client.on(events.NewMessage(chats=[source_entity]))
+    async def forward_handler(event):
+        try:
+            await telegram_client.forward_messages(
+                entity=target_entity,
+                messages=event.message,
+                from_peer=source_entity
+            )
+            logger.info(f"✅ Forwarded message {event.message.id}")
+            
+        except Exception as e:
+            logger.error(f"❌ Forward failed: {e}")
+    
+    logger.info(f"🚀 Auto-forwarding active: {SOURCE_CHANNEL} → {TARGET_CHANNEL}")
+
+@app.get("/")
+async def root():
+    """Root endpoint with service info"""
+    return {
+        "service": "Telegram Forwarder + n8n API",
+        "status": "running",
+        "telegram_connected": telegram_client is not None and telegram_client.is_connected() if telegram_client else False,
+        "target_channel": target_channel_id,
+        "api_key_required": bool(N8N_API_KEY),
+        "endpoints": {
+            "health": "/health",
+            "messages": "/api/messages/{hours}",
+            "combined": "/api/messages/{hours}/combined",
+            "docs": "/docs"
+        }
+    }
 
 @app.get("/health")
 async def health_check():
@@ -55,7 +150,9 @@ async def health_check():
     return {
         "status": "healthy", 
         "timestamp": datetime.now().isoformat(),
-        "telegram_connected": telegram_client is not None and telegram_client.is_connected()
+        "telegram_connected": telegram_client is not None and telegram_client.is_connected() if telegram_client else False,
+        "target_channel_configured": target_channel_id is not None,
+        "api_auth": "enabled" if N8N_API_KEY else "disabled"
     }
 
 @app.get("/api/messages/{hours}")
@@ -139,7 +236,7 @@ async def get_combined_messages(
             'success': True,
             'combined_text': combined_text,
             'message_count': result['message_count'],
-            'messages': result['messages'],  # Include individual messages too
+            'messages': result['messages'],
             'processing_date': datetime.now().date().isoformat()
         }
         
@@ -150,131 +247,49 @@ async def get_combined_messages(
             detail=f"Error creating combined messages: {str(e)}"
         )
 
-class TelegramForwarder:
-    def __init__(self):
-        # Use session string for cloud deployment
-        if SESSION_STRING:
-            logger.info("📱 Using existing session string")
-            self.client = TelegramClient(
-                StringSession(SESSION_STRING), API_ID, API_HASH
-            )
-        else:
-            # For initial setup - use StringSession to get session string
-            logger.info("🔑 Creating new session for first-time setup")
-            self.client = TelegramClient(
-                StringSession(), API_ID, API_HASH
-            )
-        
-        # Store globally for API access
-        global telegram_client
-        telegram_client = self.client
-        
-    async def start(self):
-        """Initialize and start the client"""
-        try:
-            await self.client.start(phone=PHONE_NUMBER)
-            
-            if await self.client.is_user_authorized():
-                me = await self.client.get_me()
-                logger.info(f"✅ Connected as {me.first_name}")
-                
-                # Print session string for Railway setup (first time only)
-                if not SESSION_STRING:
-                    session_str = self.client.session.save()
-                    logger.info("=" * 80)
-                    logger.info("🔑 COPY THIS SESSION STRING FOR RAILWAY:")
-                    logger.info(f"{session_str}")
-                    logger.info("=" * 80)
-                    logger.info("⚠️  Add this as SESSION_STRING environment variable in Railway!")
-                    logger.info("⚠️  Then redeploy your app!")
-                    logger.info("=" * 80)
-                
+# Keep the app running
+async def keep_alive():
+    """Keep the event loop running for Telegram client"""
+    try:
+        while True:
+            await asyncio.sleep(60)  # Check every minute
+            if telegram_client and telegram_client.is_connected():
+                continue
             else:
-                logger.error("❌ Not authorized")
-                return False
-                
-        except Exception as e:
-            logger.error(f"❌ Connection failed: {e}")
-            return False
-            
-        # Get channel entities
-        try:
-            self.source_entity = await self.client.get_entity(SOURCE_CHANNEL)
-            self.target_entity = await self.client.get_entity(TARGET_CHANNEL)
-            
-            # Store target channel ID globally for API access
-            global target_channel_id
-            target_channel_id = self.target_entity.id
-            
-            logger.info(f"📡 Source: {self.source_entity.title}")
-            logger.info(f"📥 Target: {self.target_entity.title} (ID: {target_channel_id})")
-        except Exception as e:
-            logger.error(f"❌ Channel error: {e}")
-            return False
-            
-        return True
-    
-    async def setup_forwarding(self):
-        """Set up message forwarding"""
-        
-        @self.client.on(events.NewMessage(chats=[self.source_entity]))
-        async def forward_handler(event):
-            try:
-                await self.client.forward_messages(
-                    entity=self.target_entity,
-                    messages=event.message,
-                    from_peer=self.source_entity
-                )
-                logger.info(f"✅ Forwarded message {event.message.id}")
-                
-            except Exception as e:
-                logger.error(f"❌ Forward failed: {e}")
-        
-        logger.info(f"🚀 Auto-forwarding: {SOURCE_CHANNEL} → {TARGET_CHANNEL}")
-        logger.info("🔄 Bot is running... (Railway will keep it alive)")
-        logger.info("🌐 API server will be available for n8n requests")
-    
-    async def run_forever(self):
-        """Keep running on Railway"""
-        try:
-            await self.client.run_until_disconnected()
-        except Exception as e:
-            logger.error(f"❌ Runtime error: {e}")
-            # Railway will restart automatically
-            await asyncio.sleep(10)
+                logger.warning("⚠️ Telegram client disconnected, attempting reconnect...")
+                if telegram_client:
+                    await telegram_client.connect()
+    except Exception as e:
+        logger.error(f"❌ Keep alive error: {e}")
 
-def run_fastapi_server():
-    """Run FastAPI server in a separate thread"""
-    port = int(os.getenv("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
+# Custom ASGI application that runs both FastAPI and Telegram
+class TelegramFastAPIApp:
+    def __init__(self):
+        self.app = app
+    
+    async def __call__(self, scope, receive, send):
+        # Let FastAPI handle HTTP requests
+        await self.app(scope, receive, send)
 
-async def main():
-    """Main function for Railway - runs both forwarder and API"""
-    
-    # Validate environment variables
-    required_vars = ['TELEGRAM_API_ID', 'TELEGRAM_API_HASH', 'TELEGRAM_PHONE', 'TARGET_CHANNEL']
-    missing_vars = [var for var in required_vars if not os.getenv(var)]
-    
-    if missing_vars:
-        logger.error(f"❌ Missing environment variables: {missing_vars}")
-        return
-    
-    logger.info("🚀 Starting Telegram Forwarder + API on Railway...")
-    logger.info(f"🔑 N8N API Key configured: {'Yes' if N8N_API_KEY != 'default-change-this-key' else 'No (using default)'}")
-    
-    # Start FastAPI server in background thread
-    api_thread = threading.Thread(target=run_fastapi_server, daemon=True)
-    api_thread.start()
-    logger.info("🌐 FastAPI server started in background")
-    
-    # Start Telegram forwarder
-    forwarder = TelegramForwarder()
-    
-    if await forwarder.start():
-        await forwarder.setup_forwarding()
-        await forwarder.run_forever()
-    else:
-        logger.error("❌ Failed to start Telegram client")
-
+# Start the combined application
 if __name__ == "__main__":
-    asyncio.run(main())
+    port = int(os.getenv("PORT", 8000))
+    logger.info(f"🌐 Starting Telegram Forwarder + FastAPI on port {port}")
+    
+    # Create background task for keeping Telegram alive
+    async def run_with_telegram():
+        # Start keep alive task
+        asyncio.create_task(keep_alive())
+        
+        # Run FastAPI
+        config = uvicorn.Config(
+            app=app,
+            host="0.0.0.0",
+            port=port,
+            log_level="info"
+        )
+        server = uvicorn.Server(config)
+        await server.serve()
+    
+    # Run everything
+    asyncio.run(run_with_telegram())
