@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 Telegram Auto-Forward Bot + API for Railway Deployment - FIXED FORWARDING
+With Forwarded-From Channel Extraction in API
 """
 
 import asyncio
@@ -184,7 +185,7 @@ async def get_recent_messages(
     hours: int = 24,
     api_key_valid: bool = Depends(verify_api_key)
 ):
-    """Get recent messages from the target channel for n8n processing"""
+    """Get recent messages from the target channel for n8n processing, with forwarded-from info included"""
     if not telegram_client or not telegram_client.is_connected():
         raise HTTPException(status_code=503, detail="Telegram client not connected")
     
@@ -207,14 +208,31 @@ async def get_recent_messages(
                 # Extract channel ID without the -100 prefix for the link
                 channel_id_for_link = str(abs(target_channel_id))[3:]  # Remove -100 prefix
                 message_link = f"https://t.me/c/{channel_id_for_link}/{message.id}"
-                
+
+                # --- NEW: Get forwarded-from channel info ---
+                fwd_name = None
+                fwd_handle = None
+                fwd_id = None
+                if message.forward:
+                    # Try to get channel entity (works for channels, not users)
+                    if hasattr(message.forward, "chat") and message.forward.chat:
+                        fwd_name = getattr(message.forward.chat, "title", None)
+                        fwd_handle = getattr(message.forward.chat, "username", None)
+                        fwd_id = getattr(message.forward.chat, "id", None)
+                    elif hasattr(message.forward, "sender_id"):
+                        fwd_id = message.forward.sender_id
+
                 messages.append({
                     'message_id': message.id,
                     'text': message.text.strip(),
                     'date': int(message.date.timestamp()),
                     'readable_date': message.date.isoformat(),
                     'link': message_link,
-                    'text_with_link': message.text.strip() + f"\n🔗 Source: {message_link}"
+                    'text_with_link': message.text.strip() + f"\n🔗 Source: {message_link}",
+                    # --- NEW FIELDS ---
+                    'forwarded_from_name': fwd_name,
+                    'forwarded_from_handle': fwd_handle,
+                    'forwarded_from_id': fwd_id
                 })
         
         # Sort by date (newest first)
@@ -249,8 +267,19 @@ async def get_combined_messages(
         result = await get_recent_messages(hours, api_key_valid)
         
         # Create combined text for AI input
+        # INCLUDE forwarded-from info if available
+        def format_message(msg):
+            src = None
+            if msg.get('forwarded_from_handle'):
+                src = f"@{msg['forwarded_from_handle']}"
+            elif msg.get('forwarded_from_name'):
+                src = msg['forwarded_from_name']
+            else:
+                src = msg['link']
+            return f"{msg['text']}\nИсточник: {src}"
+
         combined_text = '\n\n---\n\n'.join([
-            msg['text_with_link'] for msg in result['messages']
+            format_message(msg) for msg in result['messages']
         ])
         
         logger.info(f"📝 API: Created combined text from {result['message_count']} messages")
